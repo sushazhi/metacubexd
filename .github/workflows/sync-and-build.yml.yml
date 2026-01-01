@@ -25,31 +25,44 @@ jobs:
         id: get_upstream_release
         run: |
           # 获取上游仓库最新的release版本号
-          LATEST_UPSTREAM_TAG=$(curl -s https://api.github.com/repos/MetaCubeX/metacubexd/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v0.0.0")
+          LATEST_UPSTREAM_TAG=$(curl -s https://api.github.com/repos/MetaCubeX/metacubexd/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v1.235.0")
           echo "upstream_version=${LATEST_UPSTREAM_TAG#v}" >> $GITHUB_OUTPUT
+          echo "full_upstream_tag=${LATEST_UPSTREAM_TAG}" >> $GITHUB_OUTPUT
           echo "Full upstream tag: $LATEST_UPSTREAM_TAG"
           
-      - name: Get current local version
-        id: get_local_version
+      - name: Get latest Docker Hub tag
+        id: get_docker_tag
         run: |
-          # 获取本地最新的 git tag 作为当前版本号
-          LOCAL_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "local_version=${LOCAL_VERSION#v}" >> $GITHUB_OUTPUT
-          echo "Full local tag: $LOCAL_VERSION"
+          # 获取 Docker Hub 上最新的标签
+          # 如果 Docker Hub 有 API 访问限制，可以跳过此步骤并总是构建
+          LATEST_DOCKER_TAG=$(curl -s "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+          if [ "$LATEST_DOCKER_TAG" = "none" ] || [ -z "$LATEST_DOCKER_TAG" ]; then
+            echo "No existing Docker tags found, using initial version"
+            echo "docker_version=1.235.0" >> $GITHUB_OUTPUT
+          else
+            # 移除 'v' 前缀（如果存在）进行比较
+            if [[ $LATEST_DOCKER_TAG == v* ]]; then
+              VERSION=${LATEST_DOCKER_TAG#v}
+            else
+              VERSION=$LATEST_DOCKER_TAG
+            fi
+            echo "docker_version=$VERSION" >> $GITHUB_OUTPUT
+          fi
+          echo "Latest Docker Hub tag: $LATEST_DOCKER_TAG"
           
       - name: Compare versions and decide whether to build
         id: version_check
         run: |
-          if [ "${{ steps.get_upstream_release.outputs.upstream_version }}" != "${{ steps.get_local_version.outputs.local_version }}" ]; then
-            echo "Upstream version is different from local version, proceeding with build"
+          if [ "${{ steps.get_upstream_release.outputs.upstream_version }}" != "${{ steps.get_docker_tag.outputs.docker_version }}" ]; then
+            echo "Upstream version (${{ steps.get_upstream_release.outputs.upstream_version }}) is different from Docker Hub version (${{ steps.get_docker_tag.outputs.docker_version }}), proceeding with build"
             echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "new_version=${{ steps.get_upstream_release.outputs.upstream_version }}" >> $GITHUB_OUTPUT
+            echo "new_version=${{ steps.get_upstream_release.outputs.full_upstream_tag }}" >> $GITHUB_OUTPUT
           else
             echo "Versions are the same, skipping build"
             echo "should_build=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Sync with upstream repository and update version
+      - name: Sync with upstream repository
         if: steps.version_check.outputs.should_build == 'true'
         run: |
           # 添加上游仓库
@@ -58,17 +71,14 @@ jobs:
           git fetch upstream
           # 合并上游 main 分支到当前分支
           git merge upstream/main
-          
+
+      - name: Remove other workflow files locally (without committing)
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
           # 删除 .github/workflows 目录下的其他 yml 文件，只保留当前工作流文件
-          find .github/workflows -name "*.yml" -not -name "sync-and-build.yml" -delete || true
-          find .github/workflows -name "*.yaml" -not -name "sync-and-build.yml" -delete || true
-          
-          # 提交更改
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add .github/workflows/
-          git commit -m "chore: remove other workflow files, keep only sync-and-build.yml" || true
-          git push origin main
+          find .github/workflows -name "*.yml" -not -name "sync-and-build.yml" -delete 2>/dev/null || true
+          find .github/workflows -name "*.yaml" -not -name "sync-and-build.yml" -delete 2>/dev/null || true
+          echo "Cleaned up other workflow files"
 
       - name: Build and push Docker image
         if: steps.version_check.outputs.should_build == 'true'
@@ -112,4 +122,4 @@ jobs:
           cache-to: type=gha,mode=max
           tags: |
             jianhuayanyu/metacubexd:latest
-            jianhuayanyu/metacubexd:${{ steps.get_version.outputs.version }}
+            jianhuayanyu/metacubexd:${{ steps.version_check.outputs.new_version }}
