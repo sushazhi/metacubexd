@@ -67,5 +67,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            metacubex/metacubexd:latest
-            metacubex/metacubexd:${{ steps.get_version.outputs.version }}
+            jianhuayanyu/metacubexd:latest
+            jianhuayanyu/metacubexd:${{ steps.get_version.outputs.version }}
