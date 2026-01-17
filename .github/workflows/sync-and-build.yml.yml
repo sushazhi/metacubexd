@@ -34,7 +34,7 @@ jobs:
       - name: Get latest Docker Hub tag
         id: get_docker_tag
         run: |
-          # 获取 Docker Hub 上最新的标签
+          # 获取 Docker Hub 上最新的版本标签（排除 latest）
           # 使用重试机制和指数退避应对 API 限制
           echo "Attempting to fetch Docker Hub tags with retry mechanism..."
 
@@ -44,15 +44,17 @@ jobs:
 
           while [ $attempt -le $max_attempts ]; do
             echo "Attempt $attempt of $max_attempts..."
-            
+
             # 使用认证的 API 调用（如果有 token）
             if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
               echo "Using authenticated API call"
               AUTH_HEADER="-H \"Authorization: Bearer ${{ secrets.DOCKERHUB_TOKEN }}\""
-              LATEST_DOCKER_TAG=$(curl -s -L $AUTH_HEADER "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+              # 按 last_updated 排序，排除 latest，获取最新的版本标签
+              LATEST_DOCKER_TAG=$(curl -s -L $AUTH_HEADER "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/?ordering=last_updated&page_size=50" | jq -r '.results[] | select(.name != "latest") | .name' | head -n 1 2>/dev/null || echo "none")
             else
               echo "Using anonymous API call"
-              LATEST_DOCKER_TAG=$(curl -s -L "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+              # 按 last_updated 排序，排除 latest，获取最新的版本标签
+              LATEST_DOCKER_TAG=$(curl -s -L "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/?ordering=last_updated&page_size=50" | jq -r '.results[] | select(.name != "latest") | .name' | head -n 1 2>/dev/null || echo "none")
             fi
 
             # 检查响应
@@ -61,7 +63,7 @@ jobs:
               break
             else
               echo "✗ Failed to fetch Docker Hub tag"
-              
+
               if [ $attempt -lt $max_attempts ]; then
                 echo "Waiting ${delay}s before retry..."
                 sleep $delay
@@ -87,7 +89,7 @@ jobs:
             fi
             echo "docker_version=$VERSION" >> $GITHUB_OUTPUT
             echo "skip_build_check=false" >> $GITHUB_OUTPUT
-            echo "Latest Docker Hub tag: $LATEST_DOCKER_TAG"
+            echo "Latest Docker Hub version tag: $LATEST_DOCKER_TAG"
           fi
           
       - name: Compare versions and decide whether to build
