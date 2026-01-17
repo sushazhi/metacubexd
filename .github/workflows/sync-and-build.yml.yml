@@ -10,7 +10,7 @@ on:
   workflow_dispatch: # 允许手动触发
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   release-image:
@@ -24,21 +24,60 @@ jobs:
       - name: Get latest upstream release
         id: get_upstream_release
         run: |
-          # 获取上游仓库最新的release版本号
+          # 获取上游仓库最新的单个release版本号
+          echo "Fetching latest release from upstream..."
           LATEST_UPSTREAM_TAG=$(curl -s https://api.github.com/repos/MetaCubeX/metacubexd/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v1.235.0")
           echo "upstream_version=${LATEST_UPSTREAM_TAG#v}" >> $GITHUB_OUTPUT
           echo "full_upstream_tag=${LATEST_UPSTREAM_TAG}" >> $GITHUB_OUTPUT
-          echo "Full upstream tag: $LATEST_UPSTREAM_TAG"
+          echo "✓ Latest upstream release: $LATEST_UPSTREAM_TAG"
           
       - name: Get latest Docker Hub tag
         id: get_docker_tag
         run: |
           # 获取 Docker Hub 上最新的标签
-          # 如果 Docker Hub 有 API 访问限制，可以跳过此步骤并总是构建
-          LATEST_DOCKER_TAG=$(curl -s "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+          # 使用重试机制和指数退避应对 API 限制
+          echo "Attempting to fetch Docker Hub tags with retry mechanism..."
+
+          max_attempts=3
+          attempt=1
+          delay=5
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt of $max_attempts..."
+            
+            # 使用认证的 API 调用（如果有 token）
+            if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+              echo "Using authenticated API call"
+              AUTH_HEADER="-H \"Authorization: Bearer ${{ secrets.DOCKERHUB_TOKEN }}\""
+              LATEST_DOCKER_TAG=$(curl -s -L $AUTH_HEADER "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+            else
+              echo "Using anonymous API call"
+              LATEST_DOCKER_TAG=$(curl -s -L "https://registry.hub.docker.com/v2/repositories/jianhuayanyu/metacubexd/tags/" | jq -r '.results[0].name' 2>/dev/null || echo "none")
+            fi
+
+            # 检查响应
+            if [ "$LATEST_DOCKER_TAG" != "none" ] && [ -n "$LATEST_DOCKER_TAG" ]; then
+              echo "✓ Successfully fetched Docker Hub tag: $LATEST_DOCKER_TAG"
+              break
+            else
+              echo "✗ Failed to fetch Docker Hub tag"
+              
+              if [ $attempt -lt $max_attempts ]; then
+                echo "Waiting ${delay}s before retry..."
+                sleep $delay
+                delay=$((delay * 2))  # 指数退避
+              fi
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          # 最终处理
           if [ "$LATEST_DOCKER_TAG" = "none" ] || [ -z "$LATEST_DOCKER_TAG" ]; then
-            echo "No existing Docker tags found, using initial version"
-            echo "docker_version=1.235.0" >> $GITHUB_OUTPUT
+            echo "⚠️  Warning: Could not fetch Docker Hub tags after $max_attempts attempts"
+            echo "   Falling back to upstream version to force build"
+            echo "docker_version=${{ steps.get_upstream_release.outputs.upstream_version }}" >> $GITHUB_OUTPUT
+            echo "skip_build_check=true" >> $GITHUB_OUTPUT
           else
             # 移除 'v' 前缀（如果存在）进行比较
             if [[ $LATEST_DOCKER_TAG == v* ]]; then
@@ -47,49 +86,139 @@ jobs:
               VERSION=$LATEST_DOCKER_TAG
             fi
             echo "docker_version=$VERSION" >> $GITHUB_OUTPUT
+            echo "skip_build_check=false" >> $GITHUB_OUTPUT
+            echo "Latest Docker Hub tag: $LATEST_DOCKER_TAG"
           fi
-          echo "Latest Docker Hub tag: $LATEST_DOCKER_TAG"
           
       - name: Compare versions and decide whether to build
         id: version_check
         run: |
-          if [ "${{ steps.get_upstream_release.outputs.upstream_version }}" != "${{ steps.get_docker_tag.outputs.docker_version }}" ]; then
-            echo "Upstream version (${{ steps.get_upstream_release.outputs.upstream_version }}) is different from Docker Hub version (${{ steps.get_docker_tag.outputs.docker_version }}), proceeding with build"
+          UPSTREAM_VERSION="${{ steps.get_upstream_release.outputs.upstream_version }}"
+          DOCKER_VERSION="${{ steps.get_docker_tag.outputs.docker_version }}"
+          SKIP_CHECK="${{ steps.get_docker_tag.outputs.skip_build_check }}"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Version Comparison:"
+          echo "  Upstream: $UPSTREAM_VERSION"
+          echo "  Docker Hub: $DOCKER_VERSION"
+          echo "  Skip Check: $SKIP_CHECK"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ "$SKIP_CHECK" = "true" ]; then
+            echo "⚠️  Docker Hub API check failed, proceeding with build as fallback"
             echo "should_build=true" >> $GITHUB_OUTPUT
             echo "new_version=${{ steps.get_upstream_release.outputs.full_upstream_tag }}" >> $GITHUB_OUTPUT
+            echo "build_reason=Docker Hub API unavailable" >> $GITHUB_OUTPUT
+          elif [ "$UPSTREAM_VERSION" != "$DOCKER_VERSION" ]; then
+            echo "✓ Versions differ, proceeding with build"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "new_version=${{ steps.get_upstream_release.outputs.full_upstream_tag }}" >> $GITHUB_OUTPUT
+            echo "build_reason=Version mismatch ($UPSTREAM_VERSION != $DOCKER_VERSION)" >> $GITHUB_OUTPUT
           else
-            echo "Versions are the same, skipping build"
+            echo "✓ Versions are identical ($UPSTREAM_VERSION), skipping build"
             echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "build_reason=Already up to date" >> $GITHUB_OUTPUT
           fi
+
+      - name: Build decision summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Build Decision Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Should Build: ${{ steps.version_check.outputs.should_build }}"
+          echo "Build Reason: ${{ steps.version_check.outputs.build_reason }}"
+          if [ "${{ steps.version_check.outputs.should_build }}" = "true" ]; then
+            echo "New Version: ${{ steps.version_check.outputs.new_version }}"
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Sync with upstream repository
         if: steps.version_check.outputs.should_build == 'true'
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Syncing with upstream repository..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
           # 添加上游仓库
-          git remote add upstream https://github.com/MetaCubeX/metacubexd.git
+          echo "Adding upstream remote..."
+          if ! git remote add upstream https://github.com/MetaCubeX/metacubexd.git; then
+            # 如果已存在，更新 URL
+            git remote set-url upstream https://github.com/MetaCubeX/metacubexd.git
+            echo "Updated upstream remote URL"
+          fi
+
           # 获取上游仓库的最新内容
-          git fetch upstream
+          echo "Fetching upstream..."
+          if ! git fetch upstream; then
+            echo "✗ Failed to fetch from upstream"
+            exit 1
+          fi
+
+          # 检查是否有新的提交
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          echo "Local commit: $LOCAL_COMMIT"
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "⚠️  Already at upstream commit, no merge needed"
+            echo "should_skip_build=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
           # 合并上游 main 分支到当前分支
-          git merge upstream/main
+          echo "Merging upstream/main..."
+          if git merge upstream/main --no-edit; then
+            echo "✓ Merge successful"
+            # 配置 git
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            
+            # 检查是否有更改
+            if git diff --quiet HEAD~1; then
+              echo "⚠️  No changes after merge, skipping commit"
+              echo "should_skip_build=true" >> $GITHUB_ENV
+            else
+              echo "Committing merge..."
+              git commit -m "Sync with upstream ${{ steps.version_check.outputs.new_version }}"
+              echo "Pushing to origin/main..."
+              git push origin main
+              echo "✓ Successfully pushed merge to origin"
+            fi
+          else
+            echo "✗ Merge failed"
+            echo "You may need to resolve conflicts manually"
+            exit 1
+          fi
 
       - name: Remove other workflow files locally (without committing)
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         run: |
+          echo "Cleaning up other workflow files..."
           # 删除 .github/workflows 目录下的其他 yml 文件，只保留当前工作流文件
           find .github/workflows -name "*.yml" -not -name "sync-and-build.yml" -delete 2>/dev/null || true
           find .github/workflows -name "*.yaml" -not -name "sync-and-build.yml" -delete 2>/dev/null || true
-          echo "Cleaned up other workflow files"
+          echo "✓ Cleaned up other workflow files"
 
       - name: Build and push Docker image
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         run: |
-          echo "Building Docker image with new version ${{ steps.version_check.outputs.new_version }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Building Docker Image"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Version: ${{ steps.version_check.outputs.new_version }}"
+          echo "Platforms: linux/arm64"
+          echo "Tags:"
+          echo "  - jianhuayanyu/metacubexd:latest"
+          echo "  - jianhuayanyu/metacubexd:${{ steps.version_check.outputs.new_version }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
       - uses: docker/setup-qemu-action@v3
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
 
       - uses: docker/setup-docker-action@v4
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         with:
           daemon-config: |
             {
@@ -100,18 +229,18 @@ jobs:
             }
 
       - uses: docker/setup-buildx-action@v3
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         id: buildx
 
       - uses: docker/login-action@v3
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         with:
           registry: https://index.docker.io/v1/
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
-        if: steps.version_check.outputs.should_build == 'true'
+        if: steps.version_check.outputs.should_build == 'true' && env.should_skip_build != 'true'
         with:
           context: .
           builder: ${{ steps.buildx.outputs.name }}
@@ -120,6 +249,27 @@ jobs:
           platforms: linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
           tags: |
             jianhuayanyu/metacubexd:latest
             jianhuayanyu/metacubexd:${{ steps.version_check.outputs.new_version }}
+
+      - name: Workflow completion summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Workflow Execution Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ "${{ steps.version_check.outputs.should_build }}" = "false" ]; then
+            echo "✓ Build skipped - Docker Hub image is up to date"
+            echo "  Current version: ${{ steps.get_upstream_release.outputs.upstream_version }}"
+          elif [ "${{ env.should_skip_build }}" = "true" ]; then
+            echo "✓ Build skipped - No new changes from upstream"
+            echo "  Upstream version: ${{ steps.get_upstream_release.outputs.upstream_version }}"
+          else
+            echo "✓ Build completed successfully"
+            echo "  Image version: ${{ steps.version_check.outputs.new_version }}"
+          fi
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
